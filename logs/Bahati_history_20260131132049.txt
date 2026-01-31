@@ -1,0 +1,19 @@
+2026-01-31 13:20:11.324267 - FACE_LOCKED: Face locked: Bahati
+2026-01-31 13:20:20.225528 - HEAD_RIGHT: Moved right by 31.9px
+2026-01-31 13:20:21.684933 - HEAD_LEFT: Moved left by 13.7px
+2026-01-31 13:20:21.684933 - SMILE: Smile detected (ratio: 14.97)
+2026-01-31 13:20:24.512717 - HEAD_LEFT: Moved left by 18.1px
+2026-01-31 13:20:25.191001 - HEAD_RIGHT: Moved right by 17.4px
+2026-01-31 13:20:30.516761 - HEAD_LEFT: Moved left by 36.7px
+2026-01-31 13:20:30.516761 - SMILE: Smile detected (ratio: 10.40)
+2026-01-31 13:20:33.448958 - SMILE: Smile detected (ratio: 24.20)
+2026-01-31 13:20:33.810387 - SMILE: Smile detected (ratio: 64.34)
+2026-01-31 13:20:34.219376 - SMILE: Smile detected (ratio: 778.92)
+2026-01-31 13:20:35.666643 - SMILE: Smile detected (ratio: 370.56)
+2026-01-31 13:20:39.383277 - SMILE: Smile detected (ratio: 558.90)
+2026-01-31 13:20:39.792797 - HEAD_RIGHT: Moved right by 11.6px
+2026-01-31 13:20:40.244417 - SMILE: Smile detected (ratio: 202.87)
+2026-01-31 13:20:41.390682 - SMILE: Smile detected (ratio: 309.51)
+2026-01-31 13:20:43.024977 - SMILE: Smile detected (ratio: 385.82)
+2026-01-31 13:20:45.858796 - SMILE: Smile detected (ratio: 1948.45)
+2026-01-31 13:20:46.805237 - SMILE: Smile detected (ratio: 577.78)
