@@ -21,7 +21,9 @@ from __future__ import annotations
 import time
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum, auto
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import cv2
@@ -50,6 +52,74 @@ class FaceDet:
     y2: int
     score: float
     kps: np.ndarray # (5,2) float32 in FULL-frame coords
+
+@dataclass
+class ActionType(Enum):
+    FACE_LOCKED = auto()
+    FACE_LOST = auto()
+    HEAD_LEFT = auto()
+    HEAD_RIGHT = auto()
+    EYE_BLINK = auto()
+    SMILE = auto()
+
+@dataclass
+class Action:
+    type: ActionType
+    timestamp: float
+    details: str = ""
+
+@dataclass
+class FaceLock:
+    target_name: str
+    target_emb: np.ndarray
+    last_seen: float = field(default_factory=time.time)
+    last_position: Optional[Tuple[float, float]] = None
+    last_eye_dist: Optional[float] = None
+    last_mouth_size: Optional[float] = None
+    history: List[Action] = field(default_factory=list)
+    consecutive_frames: int = 0
+    
+    def update_position(self, kps: np.ndarray) -> List[Action]:
+        actions = []
+        current_time = time.time()
+        
+        # Calculate face center
+        center_x = kps[:, 0].mean()
+        center_y = kps[:, 1].mean()
+        
+        # Detect head movement
+        if self.last_position is not None:
+            dx = center_x - self.last_position[0]
+            if dx > 10:  # Threshold for right movement
+                actions.append(Action(ActionType.HEAD_RIGHT, current_time, f"Moved right by {dx:.1f}px"))
+            elif dx < -10:  # Threshold for left movement
+                actions.append(Action(ActionType.HEAD_LEFT, current_time, f"Moved left by {abs(dx):.1f}px"))
+        
+        # Detect eye blink (using vertical distance between eyes and nose)
+        eye_level = (kps[0, 1] + kps[1, 1]) / 2  # Average y of both eyes
+        nose_y = kps[2, 1]
+        eye_dist = abs(eye_level - nose_y)
+        
+        if self.last_eye_dist is not None:
+            if eye_dist < self.last_eye_dist * 0.7:  # Threshold for blink
+                actions.append(Action(ActionType.EYE_BLINK, current_time, "Blink detected"))
+        
+        # Detect smile (using mouth width/height ratio)
+        mouth_width = abs(kps[3, 0] - kps[4, 0])
+        mouth_height = abs(kps[3, 1] - kps[4, 1])
+        mouth_ratio = mouth_width / (mouth_height + 1e-5)
+        
+        if self.last_mouth_size is not None and mouth_ratio > 1.5 * self.last_mouth_size:
+            actions.append(Action(ActionType.SMILE, current_time, f"Smile detected (ratio: {mouth_ratio:.2f})"))
+        
+        # Update state
+        self.last_position = (center_x, center_y)
+        self.last_eye_dist = eye_dist
+        self.last_mouth_size = mouth_ratio
+        self.last_seen = current_time
+        self.consecutive_frames += 1
+        
+        return actions
 
 @dataclass
 class MatchResult:
@@ -358,8 +428,23 @@ class FaceDBMatcher:
 # -------------------------
 # Demo
 # -------------------------
+def save_action_history(face_name: str, actions: List[Action]):
+    if not actions:
+        return
+    
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    filename = f"{face_name}_history_{timestamp}.txt"
+    os.makedirs("logs", exist_ok=True)
+    
+    with open(f"logs/{filename}", "w") as f:
+        for action in actions:
+            time_str = datetime.fromtimestamp(action.timestamp).strftime("%Y-%m-%d %H:%M:%S.%f")
+            f.write(f"{time_str} - {action.type.name}: {action.details}\n")
+
 def main():
     db_path = Path("data/db/face_db.npz")
+    os.makedirs("logs", exist_ok=True)
+    
     det = HaarFaceMesh5pt(
         min_size=(70, 70),
         debug=False,
@@ -378,11 +463,17 @@ def main():
         det.close()
         return
     
-    print("Recognize (multi-face). q=quit, r=reload DB, +/- threshold, d=debug overlay")
+    print("Recognize (multi-face). q=quit, r=reload DB, +/- threshold, d=debug overlay, l=lock/unlock face")
     t0 = time.time()
     frames = 0
     fps: Optional[float] = None
     show_debug = False
+    
+    # Face locking state
+    face_lock: Optional[FaceLock] = None
+    lock_target: Optional[str] = None  # Will be set when a face is recognized
+    lock_threshold = 0.34
+    max_timeout = 2.0  # seconds before unlocking if face is lost
     
     try:
         while True:
@@ -409,6 +500,13 @@ def main():
             y0 = 80
             shown = 0
             
+            # Check if we should unlock due to timeout
+            current_time = time.time()
+            if face_lock and (current_time - face_lock.last_seen) > max_timeout:
+                save_action_history(face_lock.target_name, face_lock.history)
+                print(f"[FaceLock] Timeout - Unlocked {face_lock.target_name}")
+                face_lock = None
+            
             for i, f in enumerate(faces):
                 cv2.rectangle(vis, (f.x1, f.y1), (f.x2, f.y2), (0, 255, 0), 2)
                 for (x, y) in f.kps.astype(int):
@@ -419,15 +517,42 @@ def main():
                 emb = embedder.embed(aligned)
                 mr = matcher.match(emb)
                 
+                # Check if this is our locked face
+                is_locked_face = False
+                if face_lock and mr.name == face_lock.target_name and mr.accepted:
+                    # Update face lock with new position and detect actions
+                    actions = face_lock.update_position(f.kps)
+                    face_lock.history.extend(actions)
+                    for action in actions:
+                        print(f"[Action] {action.type.name}: {action.details}")
+                    is_locked_face = True
+                
                 # label
                 label = mr.name if mr.name is not None else "Unknown"
-                line1 = f"{label}"
+                status = " (LOCKED)" if is_locked_face else ""
+                line1 = f"{label}{status}"
                 line2 = f"dist={mr.distance:.3f} sim={mr.similarity:.3f}"
                 
-                # color: known green, unknown red
-                color = (0, 255, 0) if mr.accepted else (0, 0, 255)
+                # color: locked=blue, known=green, unknown=red
+                if is_locked_face:
+                    color = (255, 165, 0)  # Orange for locked face
+                    cv2.rectangle(vis, (f.x1, f.y1), (f.x2, f.y2), color, 3)
+                else:
+                    color = (0, 255, 0) if mr.accepted else (0, 0, 255)
+                
                 cv2.putText(vis, line1, (f.x1, max(0, f.y1 - 28)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
                 cv2.putText(vis, line2, (f.x1, max(0, f.y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                
+                # Store the first recognized face for potential locking
+                if mr.name and mr.accepted and not face_lock:
+                    lock_target = mr.name  # Update lock target to recognized name
+                    potential_face_to_lock = (mr.name, emb, f.kps)
+                    # Show lock hint with the person's name
+                    hint_text = f"Press 'l' to lock {mr.name}"
+                    text_size = cv2.getTextSize(hint_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)[0]
+                    cv2.putText(vis, hint_text, 
+                               (f.x1, f.y1 - 10), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1, cv2.LINE_AA)
                 
                 # aligned preview thumbnails (stack)
                 if y0 + thumb <= h and shown < 4:
@@ -448,29 +573,76 @@ def main():
                     dbg = f"kpsLeye=({f.kps[0,0]:.0f},{f.kps[0,1]:.0f})"
                     cv2.putText(vis, dbg, (10, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
             
-            # overlay header
-            header = f"IDs={len(matcher._names)} thr(dist)={matcher.dist_thresh:.2f}"
-            if fps is not None:
-                header += f" fps={fps:.1f}"
-            cv2.putText(vis, header, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2)
+            # Draw UI elements with proper spacing
+            y_offset = 30
             
-            cv2.imshow("recognize_new", vis)
+            # Main header
+            header = f"IDs: {len(matcher._names)} | Threshold: {matcher.dist_thresh:.2f}"
+            if fps is not None:
+                header += f" | FPS: {fps:.1f}"
+            cv2.putText(vis, header, (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            y_offset += 30
+            
+            # Lock status
+            if face_lock:
+                status_text = f"LOCKED ON: {face_lock.target_name} (Frames: {face_lock.consecutive_frames})"
+                cv2.putText(vis, status_text, (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                y_offset += 30
+                
+                # Last action
+                if face_lock.history and len(face_lock.history) > 0:
+                    last_action = face_lock.history[-1]
+                    action_text = f"Last Action: {last_action.type.name} - {last_action.details}"
+                    cv2.putText(vis, action_text, (10, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
+            else:
+                status_text = f"Press 'l' to lock the recognized face"
+                cv2.putText(vis, status_text, (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                y_offset += 30
+            
+            # Handle key presses
             key = cv2.waitKey(1) & 0xFF
             
-            if key == ord("q"):
+            if key == ord("q"):  # Quit
                 break
-            elif key == ord("r"):
+            elif key == ord("r"):  # Reload DB
                 matcher.reload_from(db_path)
                 print(f"[recognize] reloaded DB: {len(matcher._names)} identities")
-            elif key in (ord("+"), ord("=")):
+            elif key in (ord("+"), ord("=")):  # Increase threshold
                 matcher.dist_thresh = float(min(1.20, matcher.dist_thresh + 0.01))
                 print(f"[recognize] thr(dist)={matcher.dist_thresh:.2f} (sim~{1.0-matcher.dist_thresh:.2f})")
-            elif key == ord("-"):
+            elif key == ord("-"):  # Decrease threshold
                 matcher.dist_thresh = float(max(0.05, matcher.dist_thresh - 0.01))
                 print(f"[recognize] thr(dist)={matcher.dist_thresh:.2f} (sim~{1.0-matcher.dist_thresh:.2f})")
-            elif key == ord("d"):
+            elif key == ord("d"):  # Toggle debug
                 show_debug = not show_debug
                 print(f"[recognize] debug overlay: {'ON' if show_debug else 'OFF'}")
+            elif key == ord('l'):  # Lock/unlock face
+                if face_lock:  # Unlock if already locked
+                    save_action_history(face_lock.target_name, face_lock.history)
+                    print(f"[FaceLock] Unlocked {face_lock.target_name}")
+                    face_lock = None
+                    # Clear any existing potential face to prevent accidental re-locking
+                    if 'potential_face_to_lock' in locals():
+                        del potential_face_to_lock
+                # Only allow locking if we have a recognized face
+                elif 'potential_face_to_lock' in locals() and potential_face_to_lock and potential_face_to_lock[0] is not None:  # Lock new face
+                    name, emb, kps = potential_face_to_lock
+                    face_lock = FaceLock(
+                        target_name=name,
+                        target_emb=emb,
+                        last_seen=current_time
+                    )
+                    face_lock.update_position(kps)  # Initialize position tracking
+                    face_lock.history.append(Action(
+                        ActionType.FACE_LOCKED,
+                        current_time,
+                        f"Face locked: {name}"
+                    ))
+                    print(f"[FaceLock] Locked onto {name}")
+                    # Clear the potential face after locking
+                    del potential_face_to_lock
+            
+            cv2.imshow("Face Recognition - Press 'q' to quit", vis)
     finally:
         det.close()
         cap.release()
