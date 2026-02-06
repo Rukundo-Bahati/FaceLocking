@@ -95,59 +95,79 @@ def main():
                 # --- LOCKED MODE ---
                 # NEVER unlock automatically. Keep searching until found.
                 
-                best_face = None
+                # A. Find Locked Target (Spatial first, then Identity)
+                target_face = None
+                face_identities = {} # map id(f) -> MatchResult
                 
-                # A. Spatial Check (Fastest, prevents jumping)
-                candidates = []
-                for f in all_faces:
-                    if face_lock.last_position:
+                # 1. Spatial Search
+                if face_lock.last_position:
+                    candidates = []
+                    for f in all_faces:
                         center_x = f.kps[:, 0].mean()
                         center_y = f.kps[:, 1].mean()
                         dist = np.hypot(center_x - face_lock.last_position[0], 
                                       center_y - face_lock.last_position[1])
                         
-                        # If very close, assume it's the target (unless we have reason to doubt)
                         if dist < MAX_TRACK_DIST:
-                            # Score based on distance (closer is better)
-                            score = 1.0 - (dist / MAX_TRACK_DIST)
-                            candidates.append((score, f))
+                            # Lower distance is better
+                            candidates.append((dist, f))
+                    
+                    if candidates:
+                        candidates.sort(key=lambda x: x[0])
+                        target_face = candidates[0][1]
                 
-                if candidates:
-                    candidates.sort(key=lambda x: x[0], reverse=True)
-                    best_face = candidates[0][1]
-                
-                # B. Identity Re-acquisition (Fallback if spatial fails or lost)
-                # If we didn't find them spatially (detected faces are too far),
-                # we MUST scan all faces to find them again.
-                if not best_face:
+                # 2. Identity Search (Fallback if spatial failed)
+                if not target_face:
                     for f in all_faces:
                         aligned, _ = align_face_5pt(frame, f.kps)
                         emb = embedder.embed(aligned)
                         mr = matcher.match(emb)
-                        if mr.accepted and mr.name == face_lock.target_name:
-                            best_face = f
-                            # Update reference embedding to handle lighting changes? 
-                            # Maybe risky if we match an imposter, but ok for now.
-                            break
-
-                if best_face:
-                    target_face = best_face
-                    
-                    # Update lock state
-                    # Update lock state
-                    actions = face_lock.update_position(target_face.kps, target_face.ear)
-                    face_lock.history.extend(actions)
-                    for action in actions:
-                        print(f"[Action] {action.type.name}: {action.details}")
+                        face_identities[id(f)] = mr
                         
-                    # Visuals for Locked Face (Strict: ONLY this face)
-                    cv2.rectangle(vis, (target_face.x1, target_face.y1), (target_face.x2, target_face.y2), (255, 165, 0), 3)
-                    cv2.putText(vis, f"LOCKED: {face_lock.target_name}", 
-                               (target_face.x1, target_face.y1 - 10), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 165, 0), 2)
-                    
-                    # Reset last seen
-                    face_lock.last_seen = current_time
+                        if mr.accepted and mr.name == face_lock.target_name:
+                            target_face = f
+                            break # Found target
+                
+                # B. Process & Visualize All Faces
+                for f in all_faces:
+                    if f is target_face:
+                        # --- LOCKED TARGET ---
+                        # Update lock Logic
+                        actions = face_lock.update_position(f.kps, f.ear)
+                        face_lock.history.extend(actions)
+                        for action in actions:
+                            print(f"[Action] {action.type.name}: {action.details}")
+                            
+                        face_lock.last_seen = current_time
+                        
+                        # Visuals
+                        cv2.rectangle(vis, (f.x1, f.y1), (f.x2, f.y2), (255, 165, 0), 3)
+                        cv2.putText(vis, f"LOCKED: {face_lock.target_name}", 
+                                   (f.x1, f.y1 - 10), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 165, 0), 2)
+                    else:
+                        # --- OTHER FACES ---
+                        # Retrieve or compute identity
+                        if id(f) in face_identities:
+                            mr = face_identities[id(f)]
+                        else:
+                            # Compute now
+                            aligned, _ = align_face_5pt(frame, f.kps)
+                            emb = embedder.embed(aligned)
+                            mr = matcher.match(emb)
+                        
+                        if mr.accepted:
+                            # Enrolled: Show Name
+                            label = mr.name
+                            color = (0, 255, 0) # Green
+                        else:
+                            # Not enrolled: Unknown
+                            label = "Unknown"
+                            color = (0, 0, 255) # Red
+                            
+                        cv2.rectangle(vis, (f.x1, f.y1), (f.x2, f.y2), color, 2)
+                        cv2.putText(vis, label, (f.x1, f.y1 - 10), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
             else:
                 # --- UNLOCKED MODE ---
