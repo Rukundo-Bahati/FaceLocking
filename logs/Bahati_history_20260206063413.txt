@@ -1,0 +1,2 @@
+2026-02-06 06:33:54.123393 - FACE_LOCKED: Face locked: Bahati
+2026-02-06 06:34:01.805384 - SMILE: Smile detected (ratio: 153.69)

@@ -21,6 +21,7 @@ from __future__ import annotations
 import time
 import json
 import os
+import argparse
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum, auto
@@ -442,6 +443,10 @@ def save_action_history(face_name: str, actions: List[Action]):
             f.write(f"{time_str} - {action.type.name}: {action.details}\n")
 
 def main():
+    parser = argparse.ArgumentParser(description="Real-time Face Recognition")
+    parser.add_argument("--name", type=str, help="Specific identity to lock onto")
+    args = parser.parse_args()
+    
     db_path = Path("data/db/face_db.npz")
     os.makedirs("logs", exist_ok=True)
     
@@ -464,6 +469,9 @@ def main():
         return
     
     print("Recognize (multi-face). q=quit, r=reload DB, +/- threshold, d=debug overlay, l=lock/unlock face")
+    if args.name:
+        print(f"Waiting for targets: {args.name}...")
+
     t0 = time.time()
     frames = 0
     fps: Optional[float] = None
@@ -472,6 +480,7 @@ def main():
     # Face locking state
     face_lock: Optional[FaceLock] = None
     lock_target: Optional[str] = None  # Will be set when a face is recognized
+
     lock_threshold = 0.34
     max_timeout = 2.0  # seconds before unlocking if face is lost
     
@@ -517,15 +526,48 @@ def main():
                 emb = embedder.embed(aligned)
                 mr = matcher.match(emb)
                 
+                # Auto-lock if args.name is set
+                if args.name and not face_lock and mr.name == args.name and mr.accepted:
+                    face_lock = FaceLock(
+                        target_name=mr.name,
+                        target_emb=emb,
+                        last_seen=current_time
+                    )
+                    face_lock.update_position(f.kps)
+                    face_lock.history.append(Action(
+                        ActionType.FACE_LOCKED,
+                        current_time,
+                        f"Face locked: {mr.name}"
+                    ))
+                    print(f"[FaceLock] Auto-locked onto {mr.name}")
+                
                 # Check if this is our locked face
                 is_locked_face = False
-                if face_lock and mr.name == face_lock.target_name and mr.accepted:
+                
+                # Calculate center for spatial tracking
+                center_x = f.kps[:, 0].mean()
+                center_y = f.kps[:, 1].mean()
+                
+                # Determine if this face is the locked target
+                if face_lock:
+                    # 1. Recognized as target
+                    if mr.name == face_lock.target_name and mr.accepted:
+                        is_locked_face = True
+                    # 2. Spatial fallback: Not recognized as someone else, but close to last position
+                    elif face_lock.last_position is not None:
+                        dist = np.hypot(center_x - face_lock.last_position[0], center_y - face_lock.last_position[1])
+                        # Threshold: 100px? (on 640x480 or similar). 
+                        # Only grab if NOT recognized as someone else (to avoid stealing matched faces)
+                        if dist < 100 and not mr.accepted: 
+                            is_locked_face = True
+                            # Optional: indicate weak lock?
+                
+                if is_locked_face:
                     # Update face lock with new position and detect actions
                     actions = face_lock.update_position(f.kps)
                     face_lock.history.extend(actions)
                     for action in actions:
                         print(f"[Action] {action.type.name}: {action.details}")
-                    is_locked_face = True
                 
                 # label
                 label = mr.name if mr.name is not None else "Unknown"
@@ -544,7 +586,12 @@ def main():
                 cv2.putText(vis, line2, (f.x1, max(0, f.y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
                 
                 # Store the first recognized face for potential locking
-                if mr.name and mr.accepted and not face_lock:
+                # Only offer to lock if it matches our target (if we have one)
+                can_lock = True
+                if args.name and mr.name != args.name:
+                    can_lock = False
+
+                if mr.name and mr.accepted and not face_lock and can_lock:
                     lock_target = mr.name  # Update lock target to recognized name
                     potential_face_to_lock = (mr.name, emb, f.kps)
                     # Show lock hint with the person's name
@@ -589,11 +636,16 @@ def main():
                 cv2.putText(vis, status_text, (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
                 y_offset += 30
                 
-                # Last action
-                if face_lock.history and len(face_lock.history) > 0:
-                    last_action = face_lock.history[-1]
-                    action_text = f"Last Action: {last_action.type.name} - {last_action.details}"
-                    cv2.putText(vis, action_text, (10, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
+                # Show last 4 actions to match terminal log
+                if face_lock.history:
+                    recent_count = 4
+                    recent = face_lock.history[-recent_count:]
+                    # Draw from bottom up (newest at bottom)
+                    base_y = h - 20
+                    for act in reversed(recent):
+                         txt = f"[Action] {act.type.name}: {act.details}"
+                         cv2.putText(vis, txt, (10, base_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
+                         base_y -= 30
             else:
                 status_text = f"Press 'l' to lock the recognized face"
                 cv2.putText(vis, status_text, (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
