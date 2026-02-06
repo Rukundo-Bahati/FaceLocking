@@ -48,7 +48,7 @@ def main():
         return
 
     # Camera
-    cap = cv2.VideoCapture(0)
+    cap = cv2.VideoCapture(1)
     if not cap.isOpened():
         print("Camera not available")
         det.close()
@@ -64,7 +64,11 @@ def main():
     last_potential_target: Optional[tuple] = None # (name, emb, kps)
     
     # Tracking parameters
+    # Tracking parameters
     MAX_TRACK_DIST = 200  # Increased for robustness
+    REC_INTERVAL = 0.5    # Seconds between full ID scans
+    last_rec_time = 0.0
+    cached_others = []    # List of {'center':(x,y), 'mr':MatchResult}
     
     t0 = time.time()
     frames = 0
@@ -87,138 +91,155 @@ def main():
             H, W = vis.shape[:2]
             current_time = time.time()
 
-            # 1. Detection
-            all_faces = det.detect(frame, max_faces=5)
+            # 1. Detection & Filtering ("Ignoring Background Noise")
+            raw_faces = det.detect(frame, max_faces=10)
+            all_faces = []
+            MIN_FACE_SIZE = 60 # Ignore shadows/noise smaller than this
+            for f in raw_faces:
+                w = f.x2 - f.x1
+                h = f.y2 - f.y1
+                if w >= MIN_FACE_SIZE and h >= MIN_FACE_SIZE:
+                    all_faces.append(f)
             
-            # 2. Logic Split: Locked vs Unlocked
-            if face_lock:
-                # --- LOCKED MODE ---
-                # NEVER unlock automatically. Keep searching until found.
+            # Decisions for this frame
+            do_recognition = False
+            if (current_time - last_rec_time) > REC_INTERVAL:
+                do_recognition = True
                 
-                # A. Find Locked Target (Spatial first, then Identity)
-                target_face = None
-                face_identities = {} # map id(f) -> MatchResult
-                
-                # 1. Spatial Search
-                if face_lock.last_position:
-                    candidates = []
-                    for f in all_faces:
-                        center_x = f.kps[:, 0].mean()
-                        center_y = f.kps[:, 1].mean()
-                        dist = np.hypot(center_x - face_lock.last_position[0], 
-                                      center_y - face_lock.last_position[1])
-                        
-                        if dist < MAX_TRACK_DIST:
-                            # Lower distance is better
-                            candidates.append((dist, f))
-                    
-                    if candidates:
-                        candidates.sort(key=lambda x: x[0])
-                        target_face = candidates[0][1]
-                
-                # 2. Identity Search (Fallback if spatial failed)
-                if not target_face:
-                    for f in all_faces:
-                        aligned, _ = align_face_5pt(frame, f.kps)
-                        emb = embedder.embed(aligned)
-                        mr = matcher.match(emb)
-                        face_identities[id(f)] = mr
-                        
-                        if mr.accepted and mr.name == face_lock.target_name:
-                            target_face = f
-                            break # Found target
-                
-                # B. Process & Visualize All Faces
-                for f in all_faces:
-                    if f is target_face:
-                        # --- LOCKED TARGET ---
-                        # Update lock Logic
-                        actions = face_lock.update_position(f.kps, f.ear)
-                        face_lock.history.extend(actions)
-                        for action in actions:
-                            print(f"[Action] {action.type.name}: {action.details}")
-                            
-                        face_lock.last_seen = current_time
-                        
-                        # Visuals
-                        cv2.rectangle(vis, (f.x1, f.y1), (f.x2, f.y2), (255, 165, 0), 3)
-                        cv2.putText(vis, f"LOCKED: {face_lock.target_name}", 
-                                   (f.x1, f.y1 - 10), 
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 165, 0), 2)
-                    else:
-                        # --- OTHER FACES ---
-                        # Retrieve or compute identity
-                        if id(f) in face_identities:
-                            mr = face_identities[id(f)]
-                        else:
-                            # Compute now
-                            aligned, _ = align_face_5pt(frame, f.kps)
-                            emb = embedder.embed(aligned)
-                            mr = matcher.match(emb)
-                        
-                        if mr.accepted:
-                            # Enrolled: Show Name
-                            label = mr.name
-                            color = (0, 255, 0) # Green
-                        else:
-                            # Not enrolled: Unknown
-                            label = "Unknown"
-                            color = (0, 0, 255) # Red
-                            
-                        cv2.rectangle(vis, (f.x1, f.y1), (f.x2, f.y2), color, 2)
-                        cv2.putText(vis, label, (f.x1, f.y1 - 10), 
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            # Maps for drawing (id(face) -> (MatchResult, Embedding))
+            face_identities = {} 
+            target_face = None
 
-            else:
-                # --- UNLOCKED MODE ---
-                # Two sub-modes: 
-                # A. Strict Search (if args.name is set but not found yet) -> Hide others
-                # B. General Scan (if no args.name) -> Show all
+            # 2. "Following the Box" (Tracking the Locked Person)
+            if face_lock and face_lock.last_position:
+                # Search for target spatially
+                best_dist = float('inf')
+                best_f = None
                 
-                if args.name:
-                    # STRICT SEARCH MODE
-                    found_target = False
-                    for f in all_faces:
-                        aligned, _ = align_face_5pt(frame, f.kps)
-                        emb = embedder.embed(aligned)
-                        mr = matcher.match(emb)
+                for f in all_faces:
+                    # Calculate distance
+                    center_x = f.kps[:, 0].mean()
+                    center_y = f.kps[:, 1].mean()
+                    dist = np.hypot(center_x - face_lock.last_position[0], 
+                                  center_y - face_lock.last_position[1])
+                    
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_f = f
+                
+                # If close enough, we TRUST it is the target (No Recalc)
+                if best_f and best_dist < MAX_TRACK_DIST:
+                    target_face = best_f
+                    # Identify implicitly without running embedding
+                else:
+                    # Target lost (sticker fell off) or jumped too far
+                    do_recognition = True
+
+            # 3. "Skipping Heavy Work" (Identity Management)
+            if do_recognition:
+                # --- HEAVY FRAME (Run AI Brain) ---
+                cached_others = [] # Clear cache
+                
+                for f in all_faces:
+                    # Skip embedding the target if we are successfully tracking
+                    if f is target_face:
+                        continue
+                    
+                    # Embed & Match
+                    aligned, _ = align_face_5pt(frame, f.kps)
+                    emb = embedder.embed(aligned)
+                    mr = matcher.match(emb)
+                    face_identities[id(f)] = (mr, emb)
+                    
+                    # Check if this strictly searches for target (Re-acquisition)
+                    if face_lock and not target_face:
+                        if mr.accepted and mr.name == face_lock.target_name:
+                            target_face = f # Found them again!
+                            
+                    # Cache for next frames
+                    cx, cy = f.kps[:,0].mean(), f.kps[:,1].mean()
+                    cached_others.append({'center': (cx, cy), 'mr': mr, 'emb': emb})
+                
+                last_rec_time = current_time
+                
+            else:
+                # --- LIGHT FRAME (Use Cache) ---
+                # Map non-target faces to cached identities
+                for f in all_faces:
+                    if f is target_face: continue
+                    
+                    # Find nearest cached identity
+                    cx, cy = f.kps[:,0].mean(), f.kps[:,1].mean()
+                    
+                    best_match = None
+                    best_emb = None
+                    min_cache_dist = MAX_TRACK_DIST
+                    
+                    for item in cached_others:
+                        dist = np.hypot(cx - item['center'][0], cy - item['center'][1])
+                        if dist < min_cache_dist:
+                            min_cache_dist = dist
+                            best_match = item['mr']
+                            best_emb = item['emb']
+                            
+                    if best_match:
+                        face_identities[id(f)] = (best_match, best_emb)
+
+            # 4. Final Processing & Visualization
+            for f in all_faces:
+                # Is this the locked target?
+                if f is target_face:
+                    # Update Lock State
+                    if face_lock:
+                         actions = face_lock.update_position(f.kps, f.ear)
+                         face_lock.history.extend(actions)
+                         face_lock.last_seen = current_time
+                         
+                         for action in actions:
+                             print(f"[Action] {action.type.name}: {action.details}")
+
+                    # Visuals (Orange)
+                    cv2.rectangle(vis, (f.x1, f.y1), (f.x2, f.y2), (255, 165, 0), 3)
+                    label = face_lock.target_name if face_lock else "LOCKED"
+                    cv2.putText(vis, f"LOCKED: {label}", 
+                               (f.x1, f.y1 - 10), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 165, 0), 2)
+                               
+                else:
+                    # Other faces
+                    identity_data = face_identities.get(id(f))
+                    mr, face_emb = identity_data if identity_data else (None, None)
+                    
+                    if mr and mr.accepted:
+                        color = (0, 255, 0)
+                        label = mr.name
                         
-                        if mr.accepted and mr.name == args.name:
-                            # FOUND! Auto-lock immediately
-                            face_lock = FaceLock(target_name=mr.name, target_emb=emb)
+                        # Auto-lock logic check (only if UNLOCKED mode)
+                        if not face_lock and args.name and mr.name == args.name:
+                            # Auto-lock trigger
+                            # Use the embedding we have (either fresh or cached)
+                            face_lock = FaceLock(target_name=mr.name, target_emb=face_emb) 
                             face_lock.update_position(f.kps, f.ear)
                             print(f"[FaceLock] Auto-locked onto {mr.name}")
-                            found_target = True
-                            break # Go to loop start to render locked state next frame
+                            target_face = f 
+                            # Continue to visualize as "scanning" for this frame, locked next frame
+                            
+                    elif mr:
+                        color = (0, 0, 255)
+                        label = "Unknown"
+                    else:
+                        color = (100, 100, 100)
+                        label = "Scanning..."
                         
-                        # Use embedding similarities to find 'best' candidates if not accepted?
-                        # For now, just show nothing for others.
+                    cv2.rectangle(vis, (f.x1, f.y1), (f.x2, f.y2), color, 2)
+                    cv2.putText(vis, label, (f.x1, f.y1 - 10), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
                     
-                    if not found_target:
-                         # Draw user feedback
-                         cv2.putText(vis, f"WAITING FOR: {args.name}", (10, H - 30), 
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-                         
-                else:
-                    # GENERAL SCAN MODE
-                    for f in all_faces:
-                        aligned, _ = align_face_5pt(frame, f.kps)
-                        emb = embedder.embed(aligned)
-                        mr = matcher.match(emb)
-                        
-                        color = (0, 255, 0) if mr.accepted else (0, 0, 255)
-                        label = mr.name if mr.accepted else "Unknown"
-                        
-                        # Draw
-                        cv2.rectangle(vis, (f.x1, f.y1), (f.x2, f.y2), color, 2)
-                        cv2.putText(vis, f"{label}", (f.x1, f.y1 - 10), 
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-                        
-                        # Store as potential lock target
-                        if mr.accepted:
-                            last_potential_target = (mr.name, emb, f.kps, f.ear)
-                            hint = f"Press 'l' to lock {mr.name}"
-                            cv2.putText(vis, hint, (10, H - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+                    # Interactive Lock Hint
+                    if not face_lock and mr and mr.accepted:
+                         last_potential_target = (mr.name, face_emb, f.kps, f.ear)
+                         hint = f"Press 'l' to lock {mr.name}"
+                         cv2.putText(vis, hint, (10, H - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
 
             # --- HUD & INFO DISPLAY ---
             
